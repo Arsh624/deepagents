@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import re
 import sys
 import warnings
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock, patch
 
 import pytest
+from deepagents.backends.utils import validate_path
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from langgraph.errors import GraphInterrupt
@@ -1532,6 +1534,26 @@ class TestGetSystemPromptCwdOSError:
             prompt = get_system_prompt("test-agent")
 
         assert "Current Working Directory" in prompt
+
+
+class TestGetSystemPromptLocalPaths:
+    """Tests for the paths the local prompt tells the model to use."""
+
+    def test_example_paths_pass_file_tool_validation(self, tmp_path: Path) -> None:
+        """The model builds file paths from these, so the file tools must accept them.
+
+        On Windows the native working directory starts with a drive letter,
+        which `validate_path` rejects.
+        """
+        runtime_state.model_name = None
+
+        with patch("deepagents_code.agent.credentials", Mock()):
+            prompt = get_system_prompt("test-agent", cwd=tmp_path)
+
+        examples = re.findall(rf"`([^`]*{re.escape(tmp_path.name)}[^`]*)`", prompt)
+        assert examples
+        for example in examples:
+            validate_path(example)
 
 
 class TestGetSystemPromptSandbox:
@@ -3240,6 +3262,95 @@ class TestEnableAskUser:
         assert handlers[0]._tool_filter == ["task"]
 
 
+def _tool_request(name: str, args: dict[str, Any]) -> ToolCallRequest:
+    from langgraph.prebuilt.tool_node import ToolCallRequest
+
+    return ToolCallRequest(
+        tool_call={"name": name, "args": args, "id": "tc-1", "type": "tool_call"},
+        tool=None,
+        state={},
+        runtime=Mock(),
+    )
+
+
+class TestWindowsToolPathMiddleware:
+    """Tests for rewriting drive letter paths before file tools validate them."""
+
+    @pytest.mark.parametrize(
+        ("tool", "arg"),
+        [
+            ("read_file", "file_path"),
+            ("write_file", "file_path"),
+            ("edit_file", "file_path"),
+            ("delete", "file_path"),
+            ("ls", "path"),
+            ("glob", "path"),
+            ("grep", "path"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "drive_path",
+        [r"C:\Users\me\project\greet.bat", "C:/Users/me/project/greet.bat"],
+    )
+    def test_drive_paths_reach_file_tools_in_accepted_form(
+        self, tool: str, arg: str, drive_path: str
+    ) -> None:
+        """A path copied from `glob` output must not fail `validate_path`."""
+        from deepagents_code.agent import WindowsToolPathMiddleware
+
+        seen: list[str] = []
+
+        def handler(request: ToolCallRequest) -> str:
+            path = request.tool_call["args"][arg]
+            seen.append(validate_path(path))
+            return "ok"
+
+        result = WindowsToolPathMiddleware().wrap_tool_call(
+            _tool_request(tool, {arg: drive_path, "other": 1}), handler
+        )
+
+        assert result == "ok"
+        assert seen == ["//?/C:/Users/me/project/greet.bat"]
+
+    async def test_async_rewrites_drive_paths(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from deepagents_code.agent import WindowsToolPathMiddleware
+
+        handler = AsyncMock(return_value="ok")
+
+        await WindowsToolPathMiddleware().awrap_tool_call(
+            _tool_request("read_file", {"file_path": r"D:\data\notes.md"}), handler
+        )
+
+        request = handler.await_args.args[0]
+        assert request.tool_call["args"] == {"file_path": "//?/D:/data/notes.md"}
+
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [
+            ("read_file", {"file_path": "/Users/me/project/greet.bat"}),
+            ("read_file", {"file_path": "//?/C:/Users/me/project/greet.bat"}),
+            ("read_file", {"file_path": r"\\server\share\greet.bat"}),
+            ("read_file", {"file_path": "greet.bat"}),
+            ("read_file", {"file_path": "C:greet.bat"}),
+            ("glob", {"pattern": "*.bat"}),
+            ("execute", {"command": r"type C:\Users\me\project\greet.bat"}),
+        ],
+    )
+    def test_leaves_other_calls_unchanged(
+        self, tool: str, args: dict[str, Any]
+    ) -> None:
+        from deepagents_code.agent import WindowsToolPathMiddleware
+
+        request = _tool_request(tool, args)
+        handler = Mock(return_value="ok")
+
+        WindowsToolPathMiddleware().wrap_tool_call(request, handler)
+
+        handler.assert_called_once_with(request)
+
+
 class TestShellAllowListMiddleware:
     """Tests for inline shell command validation middleware."""
 
@@ -4839,6 +4950,39 @@ class TestCreateCliAgentInterpreterWiring:
         assert middleware.index(auto_middleware) < middleware.index(
             compaction_middleware
         )
+
+    @pytest.mark.parametrize(("platform", "expected"), [("win32", 1), ("linux", 0)])
+    def test_local_agent_rewrites_drive_paths_only_on_windows(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        platform: str,
+        expected: int,
+    ) -> None:
+        from deepagents_code.agent import WindowsToolPathMiddleware
+
+        monkeypatch.setattr("deepagents_code.agent.sys.platform", platform)
+
+        middleware = self._capture_middleware(tmp_path)
+
+        found = [m for m in middleware if isinstance(m, WindowsToolPathMiddleware)]
+        assert len(found) == expected
+
+    def test_hooks_see_the_drive_path_the_model_sent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rewrite runs inside the hooks wrapper, after `PreToolUse` sees args."""
+        from deepagents_code.agent import WindowsToolPathMiddleware
+        from deepagents_code.hooks.server_middleware import ServerHooksMiddleware
+
+        monkeypatch.setattr("deepagents_code.agent.sys.platform", "win32")
+
+        middleware = self._capture_middleware(tmp_path)
+
+        def index(kind: type) -> int:
+            return next(i for i, m in enumerate(middleware) if isinstance(m, kind))
+
+        assert index(ServerHooksMiddleware) < index(WindowsToolPathMiddleware)
 
     def test_mcp_tools_wire_timeout_middleware(self, tmp_path: Path) -> None:
         """MCP tools install the middleware that owns their call deadline."""

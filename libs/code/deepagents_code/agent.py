@@ -6,9 +6,10 @@ import inspect
 import logging
 import re
 import shutil
+import sys
 import warnings
 from dataclasses import dataclass, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, cast
 
 from deepagents import FsToolName, create_deep_agent
@@ -131,6 +132,7 @@ from deepagents_code.offload import (
     _FALLBACK_ARTIFACTS_ROOT,
     CONVERSATION_HISTORY_DIRNAME,
     _artifacts_root,
+    _filesystem_tool_path,
     _offload_fallback_root,
 )
 from deepagents_code.offload_middleware import (
@@ -863,6 +865,76 @@ def _sanitize_agent_message_name(agent_name: str) -> str:
     """
     sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "_", agent_name).strip("_")
     return sanitized or DEFAULT_AGENT_NAME
+
+
+_FILE_TOOL_PATH_ARGS: dict[str, str] = {
+    "read_file": "file_path",
+    "write_file": "file_path",
+    "edit_file": "file_path",
+    "delete": "file_path",
+    "ls": "path",
+    "glob": "path",
+    "grep": "path",
+}
+"""Path argument of each filesystem tool."""
+
+
+def _drive_path_to_tool_path(value: object) -> str | None:
+    """Return an absolute drive letter path in the filesystem tool path format.
+
+    Returns:
+        The rewritten path, or `None` when `value` is not an absolute path on a
+            drive letter (UNC and already rewritten paths included).
+    """
+    if not isinstance(value, str):
+        return None
+    path = PureWindowsPath(value)
+    if not path.drive or not path.root or path.drive.startswith("\\\\"):
+        return None
+    return _filesystem_tool_path(path)
+
+
+class WindowsToolPathMiddleware(AgentMiddleware):
+    """Rewrite drive letter paths in filesystem tool calls before validation.
+
+    The SDK's `validate_path` rejects drive letter paths, but `glob`, `ls`, and
+    `grep` return native Windows paths, which the model copies into its next
+    call. The rewritten `//?/C:/...` form passes validation and opens the same
+    file.
+    """
+
+    @staticmethod
+    def _rewrite(request: ToolCallRequest) -> ToolCallRequest:
+        tool_call = request.tool_call
+        arg = _FILE_TOOL_PATH_ARGS.get(tool_call["name"])
+        args = tool_call.get("args") or {}
+        if arg is None or (path := _drive_path_to_tool_path(args.get(arg))) is None:
+            return request
+        return request.override(tool_call={**tool_call, "args": {**args, arg: path}})
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        """Run the tool with drive letter paths rewritten.
+
+        Returns:
+            The tool execution result.
+        """
+        return handler(self._rewrite(request))
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        """Run the tool with drive letter paths rewritten.
+
+        Returns:
+            The tool execution result.
+        """
+        return await handler(self._rewrite(request))
 
 
 class ShellAllowListMiddleware(AgentMiddleware):
@@ -1772,7 +1844,8 @@ def get_system_prompt(
                     exc_info=True,
                 )
                 resolved_cwd = Path()
-        cwd = resolved_cwd
+        # File tools reject drive letters, so show the path in the form they accept.
+        cwd = _filesystem_tool_path(resolved_cwd)
         working_dir_section = (
             f"### Current Working Directory\n\n"
             f"The filesystem backend is currently operating in: `{cwd}`\n\n"
@@ -2875,6 +2948,8 @@ def create_cli_agent(
                 "available; falling back to standard HITL interrupts"
             )
 
+    # Only a local backend on Windows sees drive letter paths.
+    rewrite_drive_paths = sandbox is None and sys.platform == "win32"
     hitl_active = not auto_approve and restrictive_shell_allow_list is None
     resolved_interrupt_on = (
         _add_interrupt_on(
@@ -2939,6 +3014,9 @@ def create_cli_agent(
                 mcp_tools=mcp_tools,
             )
         )
+        # Inside the hooks wrapper, so hooks still see the path the model sent.
+        if rewrite_drive_paths:
+            middleware.append(WindowsToolPathMiddleware())
         if mcp_tools:
             from deepagents_code.config_manifest import resolve_mcp_tool_timeout
             from deepagents_code.mcp_middleware import mcp_tool_middleware
@@ -3434,6 +3512,9 @@ def create_cli_agent(
     hooks_cwd = Path(effective_cwd) if effective_cwd is not None else Path.cwd()
     server_hooks_middleware = ServerHooksMiddleware(cwd=hooks_cwd, mcp_tools=mcp_tools)
     agent_middleware.append(server_hooks_middleware)
+    # Inside the hooks wrapper, so hooks still see the path the model sent.
+    if rewrite_drive_paths:
+        agent_middleware.append(WindowsToolPathMiddleware())
     # Keep timeout results inside the hooks wrapper so PostToolUseFailure sees
     # them just like other failed tool calls.
     if mcp_tools:
